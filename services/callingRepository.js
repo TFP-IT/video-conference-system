@@ -193,9 +193,9 @@ async function registerDevice(payload = {}) {
 
   await releaseDeviceOwnership(payload);
 
-  // Single active device per user policy:
-  // Invalidate any other active devices for this user
-  const conflictingUserDevices = await CallDevice.findAll({
+  // Single active device per user policy ONLY during explicit login with a physical hardware deviceId:
+  const isTemporarySocket = deviceId === payload.socketId || !payload.fcmToken;
+  const conflictingUserDevices = (payload.isExplicitLogin && !isTemporarySocket) ? await CallDevice.findAll({
     where: {
       userId,
       deviceId: {
@@ -203,7 +203,7 @@ async function registerDevice(payload = {}) {
       },
       isLoggedIn: true,
     },
-  });
+  }) : [];
 
   if (conflictingUserDevices.length > 0) {
     await CallDevice.update(

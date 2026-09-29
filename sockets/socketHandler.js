@@ -48,13 +48,22 @@ function setupSocket(server) {
     const isUserInCall = (userId) => {
         const normalizedId = normalizeUserId(userId);
         if (!normalizedId) return false;
+        const now = Date.now();
         return Object.values(activeCalls).some((call) => {
             const isParticipant =
                 call.callerId === normalizedId ||
                 call.calleeId === normalizedId ||
                 (Array.isArray(call.participants) && call.participants.includes(normalizedId));
+            if (!isParticipant) return false;
+
+            // Auto-expire stale calls older than CALL_RING_TIMEOUT_MS in initiating/calling/ringing
+            const callAgeMs = now - (new Date(call.createdAt || call.updatedAt || 0).getTime());
+            if (['initiating', 'calling', 'ringing'].includes(call.status) && callAgeMs > CALL_RING_TIMEOUT_MS) {
+                return false;
+            }
+
             const isActive = ['initiating', 'calling', 'ringing', 'accepted'].includes(call.status);
-            return isParticipant && isActive;
+            return isActive;
         });
     };
 
@@ -120,8 +129,8 @@ function setupSocket(server) {
 
         const previousUserSockets = (users[normalizedUserId] || []).filter((user) => {
             if (!user.socket_id || user.socket_id === socket.id) return false;
-            // Never force logout sockets from the SAME device
-            if (currentDeviceId && user.deviceId && user.deviceId === currentDeviceId) {
+            // Only force logout if BOTH devices have explicit, distinct deviceIds
+            if (!currentDeviceId || !user.deviceId || user.deviceId === currentDeviceId) {
                 return false;
             }
             return true;
@@ -134,17 +143,18 @@ function setupSocket(server) {
             });
         });
 
-        // Enforce single active socket per user
-        users[normalizedUserId] = [
-            {
-                name: `${userInfo.firstName || ''} ${userInfo.lastName || ''}`.trim(),
-                socket_id: socket.id,
-                avatar: userInfo.avatar || null,
-                status: 'online',
-                lastSeen: new Date(),
-                deviceId: currentDeviceId
-            }
-        ];
+        // Store all active sockets for this user
+        const existingSockets = Array.isArray(users[normalizedUserId]) ? users[normalizedUserId] : [];
+        const filteredSockets = existingSockets.filter((u) => u.socket_id !== socket.id);
+        filteredSockets.push({
+            name: `${userInfo.firstName || ''} ${userInfo.lastName || ''}`.trim(),
+            socket_id: socket.id,
+            avatar: userInfo.avatar || null,
+            status: 'online',
+            lastSeen: new Date(),
+            deviceId: currentDeviceId
+        });
+        users[normalizedUserId] = filteredSockets;
 
         activeUsers[socket.id] = {
             ...(activeUsers[socket.id] || {}),
@@ -165,10 +175,10 @@ function setupSocket(server) {
                 userInfo,
             });
 
-            if (registered && Array.isArray(registered.deactivatedDevices)) {
+            if (currentDeviceId && registered && Array.isArray(registered.deactivatedDevices)) {
                 const currentFcmToken = userInfo.fcmToken ? String(userInfo.fcmToken).trim() : null;
                 const oldFcmTokens = registered.deactivatedDevices
-                    .filter((d) => !currentDeviceId || String(d.deviceId).trim() !== currentDeviceId)
+                    .filter((d) => String(d.deviceId).trim() !== currentDeviceId)
                     .map((d) => d.fcmToken)
                     .filter((t) => typeof t === 'string' && t.trim() && t.trim() !== currentFcmToken);
                 if (oldFcmTokens.length > 0) {
@@ -425,9 +435,7 @@ function setupSocket(server) {
             roomId,
             acceptedBy: calleeId
         }));
-        const otherCalleeSockets = getUserSockets(activeCall.calleeId).filter(sId => sId !== activeCall.callerSocketId);
-        otherCalleeSockets.forEach(sId => io.to(sId).emit('call_cancelled', { roomId, reason: 'answered_elsewhere' }));
-        sendCallLifecycleNotification(activeCall.calleeId, 'CALL_CANCELLED', roomId, { reason: 'answered_elsewhere' }).catch(e => console.error('Notification error:', e.message));
+        // Do NOT send call_cancelled or CALL_CANCELLED to callee who just accepted the call
         return { success: true, message: 'Call accepted successfully' };
     };
 
@@ -517,43 +525,62 @@ function setupSocket(server) {
                     return;
                 }
 
-                // Check if callee is already on an active call
-                if (isUserInCall(calleeId)) {
-                    console.log(`⚠️ Callee ${calleeId} is already on another active call`);
-                    const busyPayload = {
-                        success: false,
-                        status: 'busy',
-                        reason: 'busy',
-                        message: 'User is already on another call',
-                        calleeId,
-                        callerId,
-                        roomId
-                    };
-                    socket.emit('call_busy', busyPayload);
-                    socket.emit('call_rejected', busyPayload);
-                    socket.emit('call_error', busyPayload);
-
-                    await callingRepository.upsertCallHistory(roomId, {
-                        callerId,
-                        calleeId,
-                        callerName,
-                        callType,
-                        status: 'busy',
-                        disconnectReason: 'user_busy',
-                        endedAt: new Date()
+                // Auto-cleanup any stale previous calls involving callerId
+                const callerPriorRooms = Object.keys(activeCalls).filter((rId) => {
+                    const c = activeCalls[rId];
+                    return c.callerId === normalizeUserId(callerId) || c.calleeId === normalizeUserId(callerId);
+                });
+                for (const oldRoom of callerPriorRooms) {
+                    console.log(`🧹 Auto-cleaning stale prior call ${oldRoom} for caller ${callerId}`);
+                    await cleanupCall(oldRoom, {
+                        status: 'ended',
+                        reason: 'new_call_override',
+                        endedBy: callerId,
                     });
-                    return;
                 }
 
-                // Check if caller is already on an active call
-                if (isUserInCall(callerId)) {
-                    console.log(`⚠️ Caller ${callerId} is already on another active call`);
-                    socket.emit('call_error', {
-                        error: 'You are already on another active call',
-                        reason: 'busy',
-                        roomId
+                // Check if callee is already on an active call
+                if (isUserInCall(calleeId)) {
+                    const calleeActiveRoom = Object.keys(activeCalls).find((rId) => {
+                        const c = activeCalls[rId];
+                        return c.callerId === normalizeUserId(calleeId) || c.calleeId === normalizeUserId(calleeId);
                     });
-                    return;
+                    const existingCall = calleeActiveRoom ? activeCalls[calleeActiveRoom] : null;
+                    const isTrulyActive = existingCall && existingCall.status === 'accepted';
+
+                    if (isTrulyActive) {
+                        console.log(`⚠️ Callee ${calleeId} is truly on another active call (${calleeActiveRoom})`);
+                        const busyPayload = {
+                            success: false,
+                            status: 'busy',
+                            reason: 'busy',
+                            message: 'User is already on another call',
+                            calleeId,
+                            callerId,
+                            roomId
+                        };
+                        socket.emit('call_busy', busyPayload);
+                        socket.emit('call_rejected', busyPayload);
+                        socket.emit('call_error', busyPayload);
+
+                        await callingRepository.upsertCallHistory(roomId, {
+                            callerId,
+                            calleeId,
+                            callerName,
+                            callType,
+                            status: 'busy',
+                            disconnectReason: 'user_busy',
+                            endedAt: new Date()
+                        });
+                        return;
+                    } else if (calleeActiveRoom) {
+                        console.log(`🧹 Auto-cleaning stale prior call ${calleeActiveRoom} for callee ${calleeId}`);
+                        await cleanupCall(calleeActiveRoom, {
+                            status: 'ended',
+                            reason: 'stale_call_cleared',
+                            endedBy: calleeId,
+                        });
+                    }
                 }
 
                 // Store active call
@@ -629,7 +656,17 @@ socket.on('end_call', async (data) => {
     console.log('🔚 End call request received:', data);
 
     try {
-        const { roomId, from, to, endedBy, timestamp } = data;
+        const { roomId, from, to, endedBy, timestamp } = data || {};
+        let targetRoomId = roomId;
+        if (!targetRoomId || !activeCalls[targetRoomId]) {
+            const senderUserId = normalizeUserId(endedBy) || normalizeUserId(from) || activeUsers[socket.id]?.userId;
+            if (senderUserId) {
+                targetRoomId = Object.keys(activeCalls).find((rId) => {
+                    const c = activeCalls[rId];
+                    return c.callerId === senderUserId || c.calleeId === senderUserId || (Array.isArray(c.participants) && c.participants.includes(senderUserId));
+                });
+            }
+        }
         
         console.log('📞 Call ended:', {
             roomId,
@@ -639,18 +676,18 @@ socket.on('end_call', async (data) => {
             timestamp: new Date(timestamp || Date.now()).toISOString()
         });
 
-        if (activeCalls[roomId]) {
-            await cleanupCall(roomId, {
+        if (targetRoomId && activeCalls[targetRoomId]) {
+            await cleanupCall(targetRoomId, {
                 status: 'ended',
                 reason: 'ended',
-                endedBy: normalizeUserId(endedBy) || normalizeUserId(from) || normalizeUserId(to),
+                endedBy: normalizeUserId(endedBy) || normalizeUserId(from) || normalizeUserId(to) || activeUsers[socket.id]?.userId,
                 pushType: 'CALL_ENDED',
             });
         }
 
         socket.emit('call_end_confirmed', {
             success: true,
-            roomId
+            roomId: targetRoomId || roomId
         });
 
     } catch (error) {
@@ -868,7 +905,7 @@ socket.on('end_call', async (data) => {
                             });
                         });
 
-                        // Notify other devices of callee to cancel ringing
+                        // Only notify other sockets if there are other sockets
                         const otherCalleeSockets = getUserSockets(activeCalls[roomId].calleeId).filter(sId => sId !== socket.id);
                         otherCalleeSockets.forEach((socketId) => {
                             io.to(socketId).emit('call_cancelled', {
@@ -876,9 +913,6 @@ socket.on('end_call', async (data) => {
                                 reason: 'answered_elsewhere'
                             });
                         });
-                        sendCallLifecycleNotification(activeCalls[roomId].calleeId, 'CALL_CANCELLED', roomId, {
-                            reason: 'answered_elsewhere'
-                        }).catch((e) => console.error('⚠️ Failed to send answered_elsewhere notification:', e.message));
                     }
                 }
                 
