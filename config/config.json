@@ -10,10 +10,6 @@
     "username": "myroot",
     "password": "myroot123",
     "database": "video_conference",
-    "host": "127.0.0.1",
-    "dialect": "mysql"
-  },
-  "production": {
     "username": "myroot",
     "password": "myroot123",
     "database": "video_conference",
